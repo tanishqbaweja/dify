@@ -19,7 +19,6 @@ from models.knowledge_fs import (
     KnowledgeFSCapabilityReservationSummary,
     KnowledgeFSControlSpace,
     KnowledgeFSControlSpaceState,
-    KnowledgeFSLifecycleOperation,
     KnowledgeFSLifecycleOutbox,
     KnowledgeFSLifecycleOutboxStatus,
     KnowledgeFSRevokeCommandPayload,
@@ -46,6 +45,7 @@ from services.knowledge_fs.revocation_reconciler import KnowledgeFSRevocationRec
 from tests.helpers.unit.services.knowledge_fs_fakes import UnexpectedLifecycleRemote, revoke_payload
 
 _SPACE_ID = "10000000-0000-4000-8000-000000000001"
+_OTHER_SPACE_ID = "10000000-0000-4000-8000-000000000002"
 _GRANT_A = "20000000-0000-4000-8000-000000000001"
 _GRANT_B = "20000000-0000-4000-8000-000000000002"
 
@@ -99,43 +99,38 @@ class RecordingMetrics:
         raise AssertionError(read_counts)
 
 
-class ScriptedSession:
-    """Replays queued ``scalar``/``scalars`` results in call order, ignoring the statements."""
-
-    def __init__(
-        self, *, scalar_results: tuple[object, ...] = (), scalars_results: tuple[tuple[object, ...], ...] = ()
-    ) -> None:
-        self._scalar_results = deque(scalar_results)
-        self._scalars_results = deque(scalars_results)
-
-    def scalar(self, _statement: object) -> object:
-        return self._scalar_results.popleft()
-
-    def scalars(self, _statement: object) -> tuple[object, ...]:
-        return self._scalars_results.popleft()
-
-
 def _unused_session() -> Session:
     return Session()
 
 
-def _control_space(*, knowledge_space_id: str | None) -> KnowledgeFSControlSpace:
+def _grant(number: int) -> str:
+    return f"20000000-0000-4000-8000-{number:012d}"
+
+
+def _control_space(
+    *,
+    tenant_id: str = "tenant-1",
+    provisioning_key: str = "provision-1",
+    knowledge_space_id: str | None = _SPACE_ID,
+    state: KnowledgeFSControlSpaceState = KnowledgeFSControlSpaceState.ACTIVE,
+) -> KnowledgeFSControlSpace:
     return KnowledgeFSControlSpace(
-        tenant_id="tenant-1",
+        tenant_id=tenant_id,
         owner_account_id="owner-1",
-        provisioning_key="provision-1",
+        provisioning_key=provisioning_key,
         knowledge_space_id=knowledge_space_id,
+        state=state,
     )
 
 
-def _revision() -> KnowledgeFSAuthorizationRevision:
-    return KnowledgeFSAuthorizationRevision(tenant_id="tenant-1", control_space_id="control-1")
+def _revision(control_space: KnowledgeFSControlSpace) -> KnowledgeFSAuthorizationRevision:
+    return KnowledgeFSAuthorizationRevision(tenant_id=control_space.tenant_id, control_space_id=control_space.id)
 
 
-def _claims_audit(claims: dict[str, object]) -> KnowledgeFSCapabilityIssuanceAudit:
+def _claims_audit(claims: dict[str, object], *, control_space_id: str) -> KnowledgeFSCapabilityIssuanceAudit:
     return KnowledgeFSCapabilityIssuanceAudit(
         tenant_id="tenant-1",
-        control_space_id="control-1",
+        control_space_id=control_space_id,
         trace_id="trace-1",
         jti_hash="sha256:" + "a" * 64,
         claims_summary=cast(KnowledgeFSCapabilityClaimsSummary, claims),
@@ -143,28 +138,23 @@ def _claims_audit(claims: dict[str, object]) -> KnowledgeFSCapabilityIssuanceAud
 
 
 def _reservation(
-    *, summary: dict[str, object], subject: str, caller_kind: str, grant_id: str = _GRANT_A
+    *,
+    control_space_id: str,
+    grant_id: str = _GRANT_A,
+    subject: str = "dify-account:member-1",
+    caller_kind: str = "interactive",
+    summary: dict[str, object] | None = None,
 ) -> KnowledgeFSCapabilityIssuanceReservation:
+    if summary is None:
+        summary = {"caller_kind": caller_kind, "grant_id": grant_id, "subject": subject}
     return KnowledgeFSCapabilityIssuanceReservation(
         tenant_id="tenant-1",
-        control_space_id="control-1",
+        control_space_id=control_space_id,
         grant_id=grant_id,
         trace_id="trace-1",
         subject=subject,
         caller_kind=caller_kind,
         request_summary=cast(KnowledgeFSCapabilityReservationSummary, summary),
-    )
-
-
-def _revoke_command(grant_id: str) -> KnowledgeFSLifecycleOutbox:
-    return KnowledgeFSLifecycleOutbox(
-        tenant_id="tenant-1",
-        control_space_id="control-1",
-        operation_id=grant_id,
-        idempotency_key=f"kfs-revoke:{grant_id}",
-        operation=KnowledgeFSLifecycleOperation.REVOKE,
-        command_payload=cast(KnowledgeFSRevokeCommandPayload, {"grant_id": grant_id}),
-        expected_control_space_version=0,
     )
 
 
@@ -196,19 +186,6 @@ def _audit(
     )
 
 
-@pytest.mark.parametrize(
-    "sqlite_session",
-    [
-        (
-            KnowledgeFSControlSpace,
-            KnowledgeFSAuthorizationRevision,
-            KnowledgeFSCapabilityIssuanceAudit,
-            KnowledgeFSCapabilityIssuanceReservation,
-            KnowledgeFSLifecycleOutbox,
-        )
-    ],
-    indirect=True,
-)
 def test_producer_strictly_binds_and_deduplicates_grants_with_a_monotonic_space_sequence(
     sqlite_session: Session,
 ) -> None:
@@ -271,19 +248,42 @@ def test_producer_strictly_binds_and_deduplicates_grants_with_a_monotonic_space_
     assert all(payload["knowledge_space_id"] == _SPACE_ID for payload in persisted_payloads)
 
 
-@pytest.mark.parametrize(
-    "sqlite_session",
-    [
-        (
-            KnowledgeFSControlSpace,
-            KnowledgeFSAuthorizationRevision,
-            KnowledgeFSCapabilityIssuanceAudit,
-            KnowledgeFSCapabilityIssuanceReservation,
-            KnowledgeFSLifecycleOutbox,
+def test_principal_revocation_includes_reserved_grants_and_ignores_other_principals_callers_and_spaces(
+    sqlite_session: Session,
+) -> None:
+    space = _control_space()
+    other_space = _control_space(provisioning_key="provision-2", knowledge_space_id=_OTHER_SPACE_ID)
+    sqlite_session.add_all(
+        [
+            space,
+            _revision(space),
+            other_space,
+            _revision(other_space),
+            _audit(control_space_id=space.id, grant_id=_GRANT_A, jti="a"),
+            _reservation(control_space_id=space.id, grant_id=_GRANT_A),
+            # Reserved before signing; no issuance audit exists yet.
+            _reservation(control_space_id=space.id, grant_id=_GRANT_B),
+            _reservation(control_space_id=space.id, grant_id=_grant(3), subject="dify-account:other"),
+            _reservation(control_space_id=space.id, grant_id=_grant(4), caller_kind="service"),
+            _reservation(control_space_id=other_space.id, grant_id=_grant(5)),
+            _audit(control_space_id=other_space.id, grant_id=_grant(6), jti="b"),
+        ]
+    )
+    sqlite_session.commit()
+
+    with _maker(sqlite_session).begin() as session:
+        commands = KnowledgeFSRevocationCommandProducer().enqueue_principal_grants(
+            session=session,
+            tenant_id="tenant-1",
+            control_space_id=space.id,
+            subject="dify-account:member-1",
+            reason_code="permission_revoked",
+            caller_kinds=("interactive",),
         )
-    ],
-    indirect=True,
-)
+
+    assert [revoke_payload(command)["grant_id"] for command in commands] == [_GRANT_A, _GRANT_B]
+
+
 def test_revoke_consumer_accepts_idempotent_or_higher_watermark_and_reconciliation_replays(
     sqlite_session: Session,
 ) -> None:
@@ -373,97 +373,69 @@ def test_principal_revocation_rejects_unbound_operator_input(subject: str, reaso
         )
 
 
-def _principal_session(
-    *,
-    control_space: KnowledgeFSControlSpace | None = None,
-    revision: KnowledgeFSAuthorizationRevision | None = None,
-    audits: tuple[KnowledgeFSCapabilityIssuanceAudit, ...] = (),
-    reservations: tuple[KnowledgeFSCapabilityIssuanceReservation, ...] = (),
-) -> Session:
-    return cast(
-        Session,
-        ScriptedSession(scalar_results=(control_space, revision), scalars_results=(audits, reservations)),
+def test_principal_revocation_requires_control_space_revision_and_registration(sqlite_session: Session) -> None:
+    other_tenant_space = _control_space(tenant_id="tenant-2")
+    unrevised_space = _control_space(provisioning_key="provision-2", knowledge_space_id=_OTHER_SPACE_ID)
+    registered_space = _control_space(provisioning_key="provision-3")
+    unregistered_space = _control_space(
+        provisioning_key="provision-4",
+        knowledge_space_id=None,
+        state=KnowledgeFSControlSpaceState.PROVISIONING,
     )
-
-
-def test_principal_revocation_requires_control_space_revision_and_registration() -> None:
+    sqlite_session.add_all(
+        [
+            other_tenant_space,
+            _revision(other_tenant_space),
+            unrevised_space,
+            registered_space,
+            _revision(registered_space),
+            unregistered_space,
+            _revision(unregistered_space),
+            _audit(control_space_id=unregistered_space.id, grant_id=_GRANT_A, jti="a"),
+        ]
+    )
+    sqlite_session.commit()
     producer = KnowledgeFSRevocationCommandProducer()
+
+    def revoke(control_space_id: str) -> tuple[KnowledgeFSLifecycleOutbox, ...]:
+        return producer.enqueue_principal_grants(
+            session=sqlite_session,
+            tenant_id="tenant-1",
+            control_space_id=control_space_id,
+            subject="dify-account:member-1",
+            reason_code="permission_revoked",
+        )
+
     with pytest.raises(KnowledgeFSRevocationCommandError, match="control-space"):
-        producer.enqueue_principal_grants(
-            session=_principal_session(),
-            tenant_id="tenant-1",
-            control_space_id="control-1",
-            subject="dify-account:member-1",
-            reason_code="permission_revoked",
-        )
-
-    control_space = _control_space(knowledge_space_id="space-1")
+        revoke(other_tenant_space.id)
     with pytest.raises(KnowledgeFSRevocationCommandError, match="revision"):
-        producer.enqueue_principal_grants(
-            session=_principal_session(control_space=control_space),
-            tenant_id="tenant-1",
-            control_space_id="control-1",
-            subject="dify-account:member-1",
-            reason_code="permission_revoked",
-        )
-
-    revision = _revision()
-    assert (
-        producer.enqueue_principal_grants(
-            session=_principal_session(control_space=control_space, revision=revision),
-            tenant_id="tenant-1",
-            control_space_id="control-1",
-            subject="dify-account:member-1",
-            reason_code="permission_revoked",
-        )
-        == ()
-    )
-
-    audit = _claims_audit(
-        {
-            "subject": "dify-account:member-1",
-            "caller_kind": "interactive",
-            "grant_id": _GRANT_A,
-        }
-    )
+        revoke(unrevised_space.id)
+    assert revoke(registered_space.id) == ()
     with pytest.raises(KnowledgeFSRevocationCommandError, match="registered"):
-        producer.enqueue_principal_grants(
-            session=_principal_session(
-                control_space=_control_space(knowledge_space_id=None),
-                revision=revision,
-                audits=(audit,),
-            ),
-            tenant_id="tenant-1",
-            control_space_id="control-1",
-            subject="dify-account:member-1",
-            reason_code="permission_revoked",
-        )
+        revoke(unregistered_space.id)
 
 
 @pytest.mark.parametrize(
     ("claims", "message"),
     [
-        ({"subject": "other", "caller_kind": "interactive", "grant_id": _GRANT_A}, "subject binding"),
-        ({"subject": "member", "caller_kind": "service", "grant_id": _GRANT_A}, "caller binding"),
         ({"subject": "member", "caller_kind": "interactive", "grant_id": 7}, "grant id is invalid"),
         ({"subject": "member", "caller_kind": "interactive", "grant_id": "not-a-uuid"}, "not a UUID"),
     ],
 )
 def test_principal_revocation_revalidates_persisted_audit_bindings(
+    sqlite_session: Session,
     claims: dict[str, object],
     message: str,
 ) -> None:
-    session = _principal_session(
-        control_space=_control_space(knowledge_space_id="space-1"),
-        revision=_revision(),
-        audits=(_claims_audit(claims),),
-    )
+    space = _control_space()
+    sqlite_session.add_all([space, _revision(space), _claims_audit(claims, control_space_id=space.id)])
+    sqlite_session.commit()
 
     with pytest.raises(KnowledgeFSRevocationCommandError, match=message):
         KnowledgeFSRevocationCommandProducer().enqueue_principal_grants(
-            session=session,
+            session=sqlite_session,
             tenant_id="tenant-1",
-            control_space_id="control-1",
+            control_space_id=space.id,
             subject="member",
             reason_code="permission_revoked",
             caller_kinds=("interactive",),
@@ -483,7 +455,7 @@ def test_principal_revocation_revalidates_persisted_audit_bindings(
         (
             {"subject": "member", "caller_kind": "service", "grant_id": _GRANT_A},
             "member",
-            "service",
+            "interactive",
             _GRANT_A,
             "caller binding",
         ),
@@ -504,24 +476,29 @@ def test_principal_revocation_revalidates_persisted_audit_bindings(
     ],
 )
 def test_principal_revocation_revalidates_persisted_reservation_bindings(
+    sqlite_session: Session,
     summary: dict[str, object],
     subject: str,
     caller_kind: str,
     grant_id: str,
     message: str,
 ) -> None:
-    reservation = _reservation(summary=summary, subject=subject, caller_kind=caller_kind, grant_id=grant_id)
-    session = _principal_session(
-        control_space=_control_space(knowledge_space_id="space-1"),
-        revision=_revision(),
-        reservations=(reservation,),
+    space = _control_space()
+    reservation = _reservation(
+        control_space_id=space.id,
+        grant_id=grant_id,
+        subject=subject,
+        caller_kind=caller_kind,
+        summary=summary,
     )
+    sqlite_session.add_all([space, _revision(space), reservation])
+    sqlite_session.commit()
 
     with pytest.raises(KnowledgeFSRevocationCommandError, match=message):
         KnowledgeFSRevocationCommandProducer().enqueue_principal_grants(
-            session=session,
+            session=sqlite_session,
             tenant_id="tenant-1",
-            control_space_id="control-1",
+            control_space_id=space.id,
             subject="member",
             reason_code="permission_revoked",
             caller_kinds=("interactive",),
@@ -529,7 +506,7 @@ def test_principal_revocation_revalidates_persisted_reservation_bindings(
 
 
 def test_control_space_revocation_validates_callers_and_deduplicates_grants(
-    monkeypatch: pytest.MonkeyPatch,
+    sqlite_session: Session,
 ) -> None:
     producer = KnowledgeFSRevocationCommandProducer()
     with pytest.raises(KnowledgeFSRevocationCommandError, match="caller kind"):
@@ -549,41 +526,33 @@ def test_control_space_revocation_validates_callers_and_deduplicates_grants(
             caller_kinds=("interactive",),
         )
 
-    scripted = ScriptedSession(
-        scalars_results=(
-            (
-                _claims_audit({"subject": "member-b", "caller_kind": "interactive"}),
-                _claims_audit({"subject": "excluded", "caller_kind": "interactive"}),
-            ),
-            (
-                _reservation(
-                    summary={"subject": "member-a", "caller_kind": "interactive"},
-                    subject="member-a",
-                    caller_kind="interactive",
-                ),
-            ),
+    space = _control_space()
+    sqlite_session.add_all(
+        [
+            space,
+            _revision(space),
+            _audit(control_space_id=space.id, grant_id=_GRANT_B, subject="member-b", jti="a"),
+            _audit(control_space_id=space.id, grant_id=_grant(3), subject="excluded", jti="b"),
+            _audit(control_space_id=space.id, grant_id=_grant(4), subject="api-key", caller_kind="service", jti="c"),
+            _reservation(control_space_id=space.id, grant_id=_GRANT_A, subject="member-a"),
+            _reservation(control_space_id=space.id, grant_id=_GRANT_B, subject="member-b"),
+            _reservation(control_space_id=space.id, grant_id=_grant(5), subject="api-key", caller_kind="service"),
+        ]
+    )
+    sqlite_session.commit()
+
+    with _maker(sqlite_session).begin() as session:
+        commands = producer.enqueue_control_space_grants(
+            session=session,
+            tenant_id="tenant-1",
+            control_space_id=space.id,
+            reason_code="permission_revoked",
+            caller_kinds=("interactive", "interactive"),
+            excluded_subjects=("excluded",),
         )
-    )
-    commands_by_subject = {
-        "member-a": (_revoke_command(_GRANT_A),),
-        "member-b": (_revoke_command(_GRANT_B),),
-    }
-    enqueue_calls: list[dict[str, object]] = []
 
-    def enqueue(**kwargs: object) -> tuple[KnowledgeFSLifecycleOutbox, ...]:
-        enqueue_calls.append(kwargs)
-        return commands_by_subject[str(kwargs["subject"])]
-
-    monkeypatch.setattr(producer, "enqueue_principal_grants", enqueue)
-
-    commands = producer.enqueue_control_space_grants(
-        session=cast(Session, scripted),
-        tenant_id="tenant-1",
-        control_space_id="control-1",
-        reason_code="permission_revoked",
-        caller_kinds=("interactive", "interactive"),
-        excluded_subjects=("excluded",),
-    )
-
-    assert [revoke_payload(command)["grant_id"] for command in commands] == [_GRANT_A, _GRANT_B]
-    assert [call["subject"] for call in enqueue_calls] == ["member-a", "member-b"]
+    payloads = [revoke_payload(command) for command in commands]
+    assert [(payload["principal"], payload["grant_id"]) for payload in payloads] == [
+        ("member-a", _GRANT_A),
+        ("member-b", _GRANT_B),
+    ]
