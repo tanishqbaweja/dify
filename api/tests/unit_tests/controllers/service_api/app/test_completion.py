@@ -557,6 +557,73 @@ class TestCompletionCases:
                 with pytest.raises(NotFound):
                     handler(api, session=orm_session, app_model=app_model, end_user=end_user)
 
+        @pytest.mark.parametrize(
+            ("source_error", "http_error", "status_code", "error_code"),
+            [
+                pytest.param(InvokeRateLimitError, InvokeRateLimitHttpError, 429, "rate_limit_error", id="cloud-quota"),
+                pytest.param(
+                    ProviderInvokeRateLimitError, CompletionRequestError, 400, "completion_request_error", id="provider"
+                ),
+            ],
+        )
+        def test_maps_rate_limits_by_source(
+            self,
+            app: Flask,
+            orm_session: Session,
+            source_error: type[InvokeRateLimitError | ProviderInvokeRateLimitError],
+            http_error: type[InvokeRateLimitHttpError | CompletionRequestError],
+            status_code: int,
+            error_code: str,
+        ) -> None:
+            app_model, end_user, _, _ = _persist_completion_state(orm_session, AppMode.COMPLETION)
+            error = source_error("rate limit reached")
+
+            api = CompletionApi()
+            handler = unwrap(api.post)
+
+            with (
+                patch.object(AppGenerateService, "generate", side_effect=error) as generate,
+                app.test_request_context(
+                    "/completion-messages", method="POST", json={"inputs": {}, "response_mode": "blocking"}
+                ),
+                pytest.raises(http_error) as exc_info,
+            ):
+                handler(api, session=orm_session, app_model=app_model, end_user=end_user)
+
+            generate.assert_called_once()
+            assert exc_info.value.code == status_code
+            assert exc_info.value.error_code == error_code
+            assert exc_info.value.description == "rate limit reached"
+
+        def test_cloud_workflow_quota_rejection_returns_rate_limit_error(
+            self, app: Flask, monkeypatch: pytest.MonkeyPatch, orm_session: Session
+        ) -> None:
+            # AppGenerateService stays real, so its Cloud quota guard raises the error that reaches the handler.
+            apply_config_overrides(monkeypatch, DEPLOYMENT_EDITION=DeploymentEdition.CLOUD)
+            app_model, end_user, _, _ = _persist_completion_state(orm_session, AppMode.COMPLETION)
+            quota_exceeded = services.errors.app.QuotaExceededError(
+                feature="workflow", tenant_id=app_model.tenant_id, required=1
+            )
+
+            api = CompletionApi()
+            handler = unwrap(api.post)
+
+            with (
+                patch("services.app_generate_service.QuotaService.reserve", side_effect=quota_exceeded) as reserve,
+                app.test_request_context(
+                    "/completion-messages", method="POST", json={"inputs": {}, "response_mode": "blocking"}
+                ),
+                pytest.raises(InvokeRateLimitHttpError) as exc_info,
+            ):
+                handler(api, session=orm_session, app_model=app_model, end_user=end_user)
+
+            reserve.assert_called_once()
+            assert exc_info.value.code == 429
+            assert exc_info.value.error_code == "rate_limit_error"
+            assert exc_info.value.description == (
+                f"Workflow execution quota limit reached for tenant {app_model.tenant_id}"
+            )
+
     class TestCompletionStopApiController:
         def test_wrong_mode(self, app: Flask, orm_session: Session) -> None:
             api = CompletionStopApi()

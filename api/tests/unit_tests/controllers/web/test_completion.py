@@ -21,10 +21,12 @@ from controllers.web.error import (
     ProviderNotInitializeError,
     ProviderQuotaExceededError,
 )
+from controllers.web.error import InvokeRateLimitError as InvokeRateLimitHttpError
 from core.app.apps.agent_app.errors import AgentAppNotPublishedError
 from core.errors.error import ModelCurrentlyNotSupportError, ProviderTokenNotInitError, QuotaExceededError
 from graphon.model_runtime.errors.invoke import InvokeError
 from models.model import App, AppMode, EndUser
+from services.errors.llm import InvokeRateLimitError
 from tests.helpers.unit.model_factories import make_app, make_end_user
 
 
@@ -68,6 +70,33 @@ def test_unexpected_generation_error_hides_internal_details(
     assert exc_info.value.code == 500
     assert "internal provider failure" not in str(exc_info.value)
     assert exc_info.value.__context__ is error
+
+
+@pytest.mark.parametrize(
+    ("resource", "mode", "path"),
+    [
+        (CompletionApi, AppMode.COMPLETION, "/completion-messages"),
+        (ChatApi, AppMode.CHAT, "/chat-messages"),
+    ],
+)
+def test_workflow_quota_rate_limit_returns_rate_limit_error(
+    app: Flask,
+    resource: type[CompletionApi | ChatApi],
+    mode: AppMode,
+    path: str,
+) -> None:
+    error = InvokeRateLimitError("Workflow execution quota limit reached for tenant tenant-1")
+    with (
+        patch("controllers.web.completion.AppGenerateService.generate", side_effect=error),
+        app.test_request_context(path, method="POST", json={"inputs": {}, "query": "hello"}),
+        pytest.raises(InvokeRateLimitHttpError) as exc_info,
+    ):
+        resource().post(_app(mode), _end_user())
+
+    assert exc_info.value.code == 429
+    assert exc_info.value.error_code == "rate_limit_error"
+    assert exc_info.value.description == "Workflow execution quota limit reached for tenant tenant-1"
+    assert exc_info.value.__cause__ is error
 
 
 # ---------------------------------------------------------------------------

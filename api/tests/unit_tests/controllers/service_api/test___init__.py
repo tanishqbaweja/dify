@@ -410,7 +410,7 @@ def test_service_openapi_documents_decorator_user_contracts(openapi_json: OpenAP
         assert schema["properties"]["user"] == USER_PROPERTY_SCHEMA
         assert "user" in schema["required"]
 
-    for path in ("/chat-messages", "/workflows/run", "/workflows/{workflow_id}/run"):
+    for path in ("/completion-messages", "/chat-messages", "/workflows/run", "/workflows/{workflow_id}/run"):
         rate_limit_description = paths[path]["post"]["responses"]["429"]["description"]
         assert "upstream model provider rate limit" not in rate_limit_description
         assert "too_many_requests" in rate_limit_description

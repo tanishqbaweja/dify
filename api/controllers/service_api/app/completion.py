@@ -178,6 +178,7 @@ class CompletionApi(Resource):
     @error_responses(
         AppUnavailableError,
         CompletionRequestError,
+        InvokeRateLimitHttpError,
         ProviderModelCurrentlyNotSupportError,
         ProviderNotInitializeError,
         ProviderQuotaExceededError,
@@ -203,7 +204,10 @@ class CompletionApi(Resource):
                 "- `model_currently_not_support` : Current model unavailable.\n"
                 "- `completion_request_error` : Text generation failed."
             ),
-            429: "`too_many_requests` : Too many concurrent requests for this app.",
+            429: (
+                "- `too_many_requests` : Too many concurrent requests for this app.\n"
+                "- `rate_limit_error` : The Dify Cloud workflow execution quota for this workspace has been reached."
+            ),
             500: "`internal_server_error` : Internal server error.",
         },
     )
@@ -277,6 +281,8 @@ class CompletionApi(Resource):
             raise ProviderQuotaExceededError() from caught_error
         except ModelCurrentlyNotSupportError as caught_error:
             raise ProviderModelCurrentlyNotSupportError() from caught_error
+        except InvokeRateLimitError as ex:
+            raise InvokeRateLimitHttpError(ex.description) from ex
         except InvokeError as e:
             raise CompletionRequestError(e.description) from e
         except ValueError as e:

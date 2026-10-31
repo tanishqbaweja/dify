@@ -275,6 +275,12 @@ class TestInstalledAppCompletionCases:
                 "Dify Hosted OpenAI trial currently not support the GPT-4 model.",
             ),
             (InvokeError("Provider rejected input"), 400, "completion_request_error", "Provider rejected input"),
+            (
+                InvokeRateLimitError("Workflow execution quota limit reached for tenant t"),
+                429,
+                "rate_limit_error",
+                "Workflow execution quota limit reached for tenant t",
+            ),
             (ValueError("Invalid runtime arguments"), 400, "invalid_param", "Invalid runtime arguments"),
             (AccountNotFoundError(), 401, "unauthorized", "Account no longer exists."),
             (

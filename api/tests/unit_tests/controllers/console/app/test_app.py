@@ -300,6 +300,37 @@ class TestAppApisCases:
                     app_model=_make_app(),
                 )
 
+        def test_completion_api_rate_limited(
+            self, app: Flask, monkeypatch: pytest.MonkeyPatch, sqlite_engine: Engine
+        ) -> None:
+            api = completion_module.CompletionMessageApi()
+            method = unwrap(api.post)
+
+            monkeypatch.setattr(
+                completion_module.AppGenerateService,
+                "generate",
+                lambda **_kwargs: (_ for _ in ()).throw(
+                    completion_module.InvokeRateLimitError("Workflow execution quota limit reached for tenant t1")
+                ),
+            )
+
+            with (
+                Session(sqlite_engine) as session,
+                app.test_request_context("/", json={"inputs": {}, "model_config": {}, "query": "hi"}),
+                pytest.raises(completion_module.InvokeRateLimitHttpError) as exc_info,
+            ):
+                method(
+                    api,
+                    CompletionMessagePayload(inputs={}, model_config={}, query="hi"),
+                    session,
+                    _make_account(),
+                    app_model=_make_app(),
+                )
+
+            assert exc_info.value.code == 429
+            assert exc_info.value.error_code == "rate_limit_error"
+            assert exc_info.value.description == "Workflow execution quota limit reached for tenant t1"
+
     class TestOpsTraceEndpoints:
         def test_ops_trace_query_basic(self):
             query = TraceProviderQuery(tracing_provider="langfuse")

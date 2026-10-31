@@ -101,6 +101,7 @@ class CompletionApi(WebApiResource):
     @error_responses(
         AppUnavailableError,
         CompletionRequestError,
+        InvokeRateLimitHttpError,
         NotCompletionAppError,
         ProviderModelCurrentlyNotSupportError,
         ProviderNotInitializeError,
@@ -157,6 +158,8 @@ class CompletionApi(WebApiResource):
             raise ProviderQuotaExceededError() from caught_error
         except ModelCurrentlyNotSupportError as caught_error:
             raise ProviderModelCurrentlyNotSupportError() from caught_error
+        except InvokeRateLimitError as ex:
+            raise InvokeRateLimitHttpError(ex.description) from ex
         except InvokeError as e:
             raise CompletionRequestError(e.description) from e
         except ValueError as e:
